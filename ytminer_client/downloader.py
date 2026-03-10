@@ -6,6 +6,7 @@ import asyncio
 import logging
 import random
 import shutil
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -69,24 +70,30 @@ class RateLimiter:
 # ─── Cookie Manager ────────────────────────────────────────────
 
 
+AUTO_BROWSERS = ["chrome", "firefox", "brave", "edge", "safari", "chromium"]
+
+
 @dataclass
 class CookieManager:
     """Manages cookie escalation strategy.
 
     Starts with no cookies, escalates on bot detection:
-    none → explicit cookies file → cookies-from-browser
+    none → explicit cookies file → cookies-from-browser (auto-detect)
     """
     cookies_file: str | None = None
     cookies_from_browser: str | None = None
     _mode: str = "none"
     _escalated: bool = False
+    _auto_browser: str | None = None
 
     def get_args(self) -> list[str]:
         """Return yt-dlp cookie arguments for current mode."""
         if self._mode == "cookies_file" and self.cookies_file:
             return ["--cookies", self.cookies_file]
-        elif self._mode == "cookies_from_browser" and self.cookies_from_browser:
-            return ["--cookies-from-browser", self.cookies_from_browser]
+        elif self._mode == "cookies_from_browser":
+            browser = self.cookies_from_browser or self._auto_browser
+            if browser:
+                return ["--cookies-from-browser", browser]
         return []
 
     def escalate(self) -> bool:
@@ -100,18 +107,54 @@ class CookieManager:
                 self._mode = "cookies_from_browser"
                 logger.info(f"Escalating to cookies from browser: {self.cookies_from_browser}")
                 return True
-        elif self._mode == "cookies_file" and self.cookies_from_browser:
-            self._mode = "cookies_from_browser"
-            logger.info(f"Escalating to cookies from browser: {self.cookies_from_browser}")
-            return True
+            else:
+                # Auto-detect browser cookies
+                browser = self._detect_browser()
+                if browser:
+                    self._auto_browser = browser
+                    self._mode = "cookies_from_browser"
+                    logger.info(f"Escalating to auto-detected browser cookies: {browser}")
+                    return True
+        elif self._mode == "cookies_file":
+            if self.cookies_from_browser:
+                self._mode = "cookies_from_browser"
+                logger.info(f"Escalating to cookies from browser: {self.cookies_from_browser}")
+                return True
+            else:
+                browser = self._detect_browser()
+                if browser:
+                    self._auto_browser = browser
+                    self._mode = "cookies_from_browser"
+                    logger.info(f"Escalating to auto-detected browser cookies: {browser}")
+                    return True
 
         if not self._escalated:
             self._escalated = True
-            logger.warning(
-                "Bot detection and no more cookie strategies available. "
-                "Try: ytminer-download --cookies-from-browser chrome"
-            )
+            logger.warning("Bot detection and no cookie strategies worked.")
         return False
+
+    def _detect_browser(self) -> str | None:
+        """Try each browser to see if yt-dlp can extract cookies from it."""
+        yt_dlp_bin = str(Path(sys.executable).parent / "yt-dlp")
+        if not Path(yt_dlp_bin).exists():
+            yt_dlp_bin = shutil.which("yt-dlp") or "yt-dlp"
+
+        for browser in AUTO_BROWSERS:
+            try:
+                proc = subprocess.run(
+                    [yt_dlp_bin, "--cookies-from-browser", browser,
+                     "--skip-download", "--no-warnings", "-q",
+                     "https://www.youtube.com/watch?v=dQw4w9WgXcQ"],
+                    capture_output=True, timeout=15,
+                )
+                # If it didn't error about the browser, it worked
+                stderr = proc.stderr.decode(errors="replace").lower()
+                if "no supported browser" not in stderr and "could not find" not in stderr and "error" not in stderr:
+                    logger.info(f"Detected browser with cookies: {browser}")
+                    return browser
+            except Exception:
+                continue
+        return None
 
     @property
     def mode(self) -> str:
