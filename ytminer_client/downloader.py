@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import shutil
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -147,8 +149,13 @@ async def download_video(
 
     t0 = time.monotonic()
 
+    # Find yt-dlp in the same venv as this Python process
+    yt_dlp_bin = str(Path(sys.executable).parent / "yt-dlp")
+    if not Path(yt_dlp_bin).exists():
+        yt_dlp_bin = shutil.which("yt-dlp") or "yt-dlp"
+
     cmd = [
-        "yt-dlp",
+        yt_dlp_bin,
         "-f", "best[ext=mp4]/best",
         "-o", str(video_path),
         "--write-info-json",
