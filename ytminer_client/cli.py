@@ -1,5 +1,7 @@
 """CLI for distributed YouTube video downloading."""
 
+from __future__ import annotations
+
 import asyncio
 import logging
 import platform
