@@ -163,7 +163,7 @@ async def download_video(
         "--no-playlist",
         "--socket-timeout", "30",
         "--retries", "2",
-        "--quiet", "--no-warnings",
+        "--no-warnings",
     ]
     cmd.extend(cookie_manager.get_args())
     cmd.append(f"https://www.youtube.com/watch?v={video_id}")
@@ -185,6 +185,7 @@ async def download_video(
             )
 
         err_text = stderr.decode(errors="replace").strip()
+        logger.warning(f"yt-dlp failed for {video_id}: {err_text}")
         category = classify_error(err_text)
 
         # Bot detection — try cookie escalation
