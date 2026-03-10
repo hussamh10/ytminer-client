@@ -60,6 +60,7 @@ class ServerClient:
         batch_id: str,
         results: dict[str, str],
         errors: dict[str, str],
+        channel: str | None = None,
     ) -> dict:
         resp = self.http.post(
             f"{self.server_url}/report",
@@ -68,6 +69,7 @@ class ServerClient:
                 "worker": self.worker_name,
                 "results": results,
                 "errors": errors,
+                "channel": channel,
             },
         )
         resp.raise_for_status()
@@ -174,14 +176,14 @@ async def download_loop(
         )
 
         try:
-            resp = server.report_batch(batch_id, results, errors)
+            resp = server.report_batch(batch_id, results, errors, channel=channel)
             batch = resp.get("next_batch")
         except Exception as e:
             click.echo(f"  Error reporting to server: {e}")
             click.echo("  Retrying in 30s...")
             await asyncio.sleep(30)
             try:
-                resp = server.report_batch(batch_id, results, errors)
+                resp = server.report_batch(batch_id, results, errors, channel=channel)
                 batch = resp.get("next_batch")
             except Exception as e2:
                 click.echo(f"  Still failing: {e2}. Exiting.")
