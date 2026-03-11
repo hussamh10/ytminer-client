@@ -17,6 +17,8 @@ from ytminer_client.downloader import CookieManager, DownloadResult, RateLimiter
 
 logger = logging.getLogger("ytminer-client")
 
+COOLDOWN_STEPS = [5 * 60, 15 * 60, 30 * 60, 60 * 60]  # 5m, 15m, 30m, 1h
+
 
 def setup_logging(verbose: bool):
     level = logging.DEBUG if verbose else logging.INFO
@@ -60,6 +62,7 @@ class ServerClient:
         batch_id: str,
         results: dict[str, str],
         errors: dict[str, str],
+        channel: str | None = None,
     ) -> dict:
         resp = self.http.post(
             f"{self.server_url}/report",
@@ -68,6 +71,7 @@ class ServerClient:
                 "worker": self.worker_name,
                 "results": results,
                 "errors": errors,
+                "channel": channel,
             },
         )
         resp.raise_for_status()
@@ -89,6 +93,35 @@ class ServerClient:
         self.http.close()
 
 
+# ─── Cooldown ──────────────────────────────────────────────────
+
+
+async def bot_cooldown(
+    cookie_manager: CookieManager,
+    output_dir: Path,
+    cooldown_step: int,
+) -> bool:
+    """Progressive cooldown on bot detection. Returns True if recovered."""
+    wait_secs = COOLDOWN_STEPS[min(cooldown_step, len(COOLDOWN_STEPS) - 1)]
+    wait_min = wait_secs // 60
+
+    click.echo(f"  Bot detected! Cooling down for {wait_min}min...")
+    await asyncio.sleep(wait_secs)
+
+    # Test with a known public video
+    click.echo(f"  Testing if block lifted...")
+    test_result = await download_video(
+        "dQw4w9WgXcQ", output_dir, cookie_manager, timeout=30,
+    )
+
+    if test_result.error_category == "bot_blocked":
+        click.echo(f"  Still blocked.")
+        return False
+
+    click.echo(f"  Block lifted! Resuming downloads.")
+    return True
+
+
 # ─── Main Download Loop ─────────────────────────────────────────
 
 
@@ -107,6 +140,7 @@ async def download_loop(
     session_failed = 0
     session_skipped = 0
     session_start = time.monotonic()
+    consecutive_bot = 0
 
     click.echo(f"Worker: {server.worker_name}")
     click.echo(f"Server: {server.server_url}")
@@ -133,8 +167,8 @@ async def download_loop(
         errors: dict[str, str] = {}
 
         for i, video_id in enumerate(video_ids):
-            # Rate limit
-            if i > 0:
+            # Rate limit (skip delay for skipped/permanent videos)
+            if i > 0 and not (results.get(video_ids[i - 1]) == "skipped"):
                 await rate_limiter.wait()
 
             result = await download_video(video_id, channel_dir, cookie_manager)
@@ -146,19 +180,40 @@ async def download_loop(
             # Update session counters
             if result.status == "ok":
                 session_ok += 1
+                consecutive_bot = 0
                 size_str = format_size(result.file_size)
                 click.echo(f"  [{i+1}/{len(video_ids)}] {video_id}  OK  {size_str}  {result.elapsed:.1f}s")
+                rate_limiter.report_success()
             elif result.status == "skipped":
                 session_skipped += 1
+                consecutive_bot = 0
                 reason = result.error_category or "exists"
                 click.echo(f"  [{i+1}/{len(video_ids)}] {video_id}  SKIP  ({reason})")
             else:
                 session_failed += 1
                 click.echo(f"  [{i+1}/{len(video_ids)}] {video_id}  FAIL  ({result.error_category})")
                 rate_limiter.report_error(result.error_category or "unknown")
-                continue
 
-            rate_limiter.report_success()
+                # Bot detection cooldown
+                if result.error_category == "bot_blocked":
+                    consecutive_bot += 1
+                    if consecutive_bot >= 3:
+                        # Try progressive cooldowns
+                        for step in range(len(COOLDOWN_STEPS)):
+                            recovered = await bot_cooldown(cookie_manager, channel_dir, step)
+                            if recovered:
+                                consecutive_bot = 0
+                                break
+                        else:
+                            click.echo("  All cooldowns exhausted. Stopping.")
+                            # Report what we have so far
+                            try:
+                                server.report_batch(batch_id, results, errors, channel=channel)
+                            except Exception:
+                                pass
+                            return
+                else:
+                    consecutive_bot = 0
 
         # Report and get next batch
         elapsed = time.monotonic() - session_start
@@ -174,14 +229,14 @@ async def download_loop(
         )
 
         try:
-            resp = server.report_batch(batch_id, results, errors)
+            resp = server.report_batch(batch_id, results, errors, channel=channel)
             batch = resp.get("next_batch")
         except Exception as e:
             click.echo(f"  Error reporting to server: {e}")
             click.echo("  Retrying in 30s...")
             await asyncio.sleep(30)
             try:
-                resp = server.report_batch(batch_id, results, errors)
+                resp = server.report_batch(batch_id, results, errors, channel=channel)
                 batch = resp.get("next_batch")
             except Exception as e2:
                 click.echo(f"  Still failing: {e2}. Exiting.")
