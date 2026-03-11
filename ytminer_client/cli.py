@@ -17,7 +17,7 @@ from ytminer_client.downloader import CookieManager, DownloadResult, RateLimiter
 
 logger = logging.getLogger("ytminer-client")
 
-COOLDOWN_STEPS = [5 * 60, 15 * 60, 30 * 60, 60 * 60]  # 5m, 15m, 30m, 1h
+COOLDOWN_STEPS = [30 * 60, 60 * 60, 2 * 3600]  # 30m, 1h, 2h (then 2h forever)
 
 
 def setup_logging(verbose: bool):
@@ -122,6 +122,36 @@ async def bot_cooldown(
     return True
 
 
+# ─── Network Retry Helpers ─────────────────────────────────────
+
+
+async def fetch_with_retry(server: ServerClient, channel: str | None, batch_size: int) -> dict | None:
+    """Fetch a batch, retrying forever on network errors."""
+    wait = 30
+    while True:
+        try:
+            batch = server.fetch_batch(channel=channel, batch_size=batch_size)
+            return batch
+        except Exception as e:
+            click.echo(f"  Network error fetching batch: {e}. Retrying in {wait}s...")
+            await asyncio.sleep(wait)
+            wait = min(wait * 2, 600)  # cap at 10min
+
+
+async def report_with_retry(
+    server: ServerClient, batch_id: str, results: dict, errors: dict, channel: str | None,
+) -> dict:
+    """Report batch results, retrying forever on network errors."""
+    wait = 30
+    while True:
+        try:
+            return server.report_batch(batch_id, results, errors, channel=channel)
+        except Exception as e:
+            click.echo(f"  Network error reporting batch: {e}. Retrying in {wait}s...")
+            await asyncio.sleep(wait)
+            wait = min(wait * 2, 600)
+
+
 # ─── Main Download Loop ─────────────────────────────────────────
 
 
@@ -149,7 +179,7 @@ async def download_loop(
     click.echo()
 
     # First batch
-    batch = server.fetch_batch(channel=channel, batch_size=batch_size)
+    batch = await fetch_with_retry(server, channel, batch_size)
 
     while batch:
         batch_id = batch["batch_id"]
@@ -198,20 +228,13 @@ async def download_loop(
                 if result.error_category == "bot_blocked":
                     consecutive_bot += 1
                     if consecutive_bot >= 3:
-                        # Try progressive cooldowns
-                        for step in range(len(COOLDOWN_STEPS)):
+                        step = 0
+                        while True:
                             recovered = await bot_cooldown(cookie_manager, channel_dir, step)
                             if recovered:
                                 consecutive_bot = 0
                                 break
-                        else:
-                            click.echo("  All cooldowns exhausted. Stopping.")
-                            # Report what we have so far
-                            try:
-                                server.report_batch(batch_id, results, errors, channel=channel)
-                            except Exception:
-                                pass
-                            return
+                            step += 1
                 else:
                     consecutive_bot = 0
 
@@ -228,19 +251,10 @@ async def download_loop(
             f"{session_skipped} skipped | {rate:.0f}/hr"
         )
 
-        try:
-            resp = server.report_batch(batch_id, results, errors, channel=channel)
-            batch = resp.get("next_batch")
-        except Exception as e:
-            click.echo(f"  Error reporting to server: {e}")
-            click.echo("  Retrying in 30s...")
-            await asyncio.sleep(30)
-            try:
-                resp = server.report_batch(batch_id, results, errors, channel=channel)
-                batch = resp.get("next_batch")
-            except Exception as e2:
-                click.echo(f"  Still failing: {e2}. Exiting.")
-                break
+        resp = await report_with_retry(server, batch_id, results, errors, channel)
+        batch = resp.get("next_batch")
+        if not batch:
+            batch = await fetch_with_retry(server, channel, batch_size)
 
         # Periodic version check
         if batch_count % update_check_interval == 0:
