@@ -359,6 +359,10 @@ async def download_loop(
             f"{session_skipped} skipped | {rate:.0f}/hr"
         )
 
+        # Wait for uploads to finish before reporting (so 'done' = actually uploaded)
+        if uploader.enabled and uploader._queue:
+            await uploader._queue.join()
+
         resp = await report_with_retry(server, batch_id, results, errors, channel)
         batch = resp.get("next_batch")
         if not batch:
