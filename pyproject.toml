@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ytminer-client"
-version = "0.2.0"
+version = "0.2.1"
 description = "Distributed YouTube video downloader client"
 requires-python = ">=3.10"
 dependencies = [
