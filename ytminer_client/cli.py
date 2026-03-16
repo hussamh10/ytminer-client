@@ -93,6 +93,75 @@ class ServerClient:
         self.http.close()
 
 
+# ─── Uploader ─────────────────────────────────────────────────
+
+
+class Uploader:
+    def __init__(self, server_url: str, worker_name: str, enabled: bool = False, cleanup: bool = True):
+        self.server_url = server_url.rstrip("/")
+        self.worker_name = worker_name
+        self.enabled = enabled
+        self.cleanup = cleanup
+        self._http: httpx.AsyncClient | None = None
+        self.total_uploaded = 0
+        self.total_bytes = 0
+
+    async def start(self):
+        if self.enabled:
+            self._http = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0))
+
+    async def close(self):
+        if self._http:
+            await self._http.aclose()
+
+    async def upload_video(self, video_id: str, channel: str, channel_dir: Path) -> bool:
+        if not self.enabled or not self._http:
+            return False
+
+        video_path = channel_dir / f"{video_id}.mp4"
+        info_path = channel_dir / f"{video_id}.info.json"
+
+        success = True
+        for path in [video_path, info_path]:
+            if not path.exists():
+                continue
+            ok = await self._upload_file(channel, video_id, path)
+            if not ok:
+                success = False
+
+        if success and self.cleanup:
+            for path in [video_path, info_path]:
+                if path.exists():
+                    path.unlink()
+
+        if success:
+            self.total_uploaded += 1
+
+        return success
+
+    async def _upload_file(self, channel: str, video_id: str, file_path: Path) -> bool:
+        url = f"{self.server_url}/upload/{channel}/{video_id}"
+        wait = 30
+        for attempt in range(5):
+            try:
+                file_size = file_path.stat().st_size
+                with open(file_path, "rb") as f:
+                    resp = await self._http.post(
+                        url,
+                        content=f,
+                        params={"worker": self.worker_name, "filename": file_path.name},
+                        headers={"Content-Type": "application/octet-stream"},
+                    )
+                resp.raise_for_status()
+                self.total_bytes += file_size
+                return True
+            except Exception as e:
+                logger.warning(f"Upload failed for {file_path.name} (attempt {attempt+1}): {e}")
+                await asyncio.sleep(wait)
+                wait = min(wait * 2, 300)
+        return False
+
+
 # ─── Cooldown ──────────────────────────────────────────────────
 
 
@@ -160,11 +229,12 @@ async def download_loop(
     output_dir: Path,
     cookie_manager: CookieManager,
     rate_limiter: RateLimiter,
+    uploader: Uploader,
     channel: str | None,
     batch_size: int,
     update_check_interval: int = 5,
 ):
-    """Main loop: fetch batch → download → report → repeat."""
+    """Main loop: fetch batch → download → upload → report → repeat."""
     batch_count = 0
     session_ok = 0
     session_failed = 0
@@ -172,10 +242,18 @@ async def download_loop(
     session_start = time.monotonic()
     consecutive_bot = 0
 
+    # One-time async browser detection (non-blocking)
+    await cookie_manager.warmup()
+
+    # Start uploader if enabled
+    await uploader.start()
+
     click.echo(f"Worker: {server.worker_name}")
     click.echo(f"Server: {server.server_url}")
     click.echo(f"Output: {output_dir}")
     click.echo(f"Cookie mode: {cookie_manager.mode}")
+    if uploader.enabled:
+        click.echo(f"Upload: enabled (cleanup: {uploader.cleanup})")
     click.echo()
 
     # First batch
@@ -214,6 +292,13 @@ async def download_loop(
                 size_str = format_size(result.file_size)
                 click.echo(f"  [{i+1}/{len(video_ids)}] {video_id}  OK  {size_str}  {result.elapsed:.1f}s")
                 rate_limiter.report_success()
+
+                # Upload immediately after download
+                if uploader.enabled:
+                    uploaded = await uploader.upload_video(video_id, batch_channel, channel_dir)
+                    if uploaded:
+                        click.echo(f"    -> uploaded")
+
             elif result.status == "skipped":
                 session_skipped += 1
                 consecutive_bot = 0
@@ -261,7 +346,7 @@ async def download_loop(
             new_version = server.check_version()
             if new_version:
                 click.echo(
-                    f"\n  Update available: v{__version__} → v{new_version}\n"
+                    f"\n  Update available: v{__version__} -> v{new_version}\n"
                     f"  Run: pip install --upgrade ytminer-client\n"
                 )
 
@@ -269,6 +354,8 @@ async def download_loop(
     click.echo()
     click.echo(f"All done! {session_ok} downloaded, {session_failed} failed, {session_skipped} skipped")
     click.echo(f"Total time: {elapsed/3600:.1f}h")
+
+    await uploader.close()
 
 
 # ─── CLI ─────────────────────────────────────────────────────────
@@ -284,8 +371,10 @@ async def download_loop(
 @click.option("--jitter", default=10.0, help="Random jitter added to delay in seconds (default: 10)")
 @click.option("--cookies", default=None, help="Path to cookies.txt file")
 @click.option("--cookies-from-browser", default=None, help="Browser to extract cookies from (e.g. chrome, firefox)")
+@click.option("--upload", is_flag=True, help="Upload videos to server after download (for ephemeral envs like Colab)")
+@click.option("--keep-files", is_flag=True, help="Keep local files after upload (default: delete after upload)")
 @click.option("--verbose", is_flag=True, help="Enable debug logging")
-def main(server, output, worker_name, channel, batch_size, delay, jitter, cookies, cookies_from_browser, verbose):
+def main(server, output, worker_name, channel, batch_size, delay, jitter, cookies, cookies_from_browser, upload, keep_files, verbose):
     """Download YouTube videos from a ytminer server."""
     setup_logging(verbose)
 
@@ -300,6 +389,12 @@ def main(server, output, worker_name, channel, batch_size, delay, jitter, cookie
         cookies_from_browser=cookies_from_browser,
     )
     rate_limiter = RateLimiter(base_delay=delay, jitter=jitter)
+    uploader = Uploader(
+        server_url=server,
+        worker_name=worker_name,
+        enabled=upload,
+        cleanup=not keep_files,
+    )
 
     srv = ServerClient(server, worker_name)
 
@@ -324,6 +419,7 @@ def main(server, output, worker_name, channel, batch_size, delay, jitter, cookie
             output_dir=output_dir,
             cookie_manager=cookie_manager,
             rate_limiter=rate_limiter,
+            uploader=uploader,
             channel=channel,
             batch_size=batch_size,
         ))

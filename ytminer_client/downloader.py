@@ -6,7 +6,6 @@ import asyncio
 import logging
 import random
 import shutil
-import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -14,6 +13,14 @@ from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger("ytminer-client.downloader")
+
+
+def _find_yt_dlp() -> str:
+    """Find yt-dlp binary in the same venv as this Python process."""
+    venv_bin = Path(sys.executable).parent / "yt-dlp"
+    if venv_bin.exists():
+        return str(venv_bin)
+    return shutil.which("yt-dlp") or "yt-dlp"
 
 
 # ─── Error Classification ──────────────────────────────────────
@@ -85,6 +92,7 @@ class CookieManager:
     _mode: str = "none"
     _escalated: bool = False
     _auto_browser: str | None = None
+    _browser_detected: bool = False
 
     def get_args(self) -> list[str]:
         """Return yt-dlp cookie arguments for current mode."""
@@ -95,6 +103,18 @@ class CookieManager:
             if browser:
                 return ["--cookies-from-browser", browser]
         return []
+
+    async def warmup(self):
+        """Detect available browser cookies once at startup (non-blocking)."""
+        if self.cookies_from_browser or self.cookies_file:
+            return  # user provided explicit cookies, no need to auto-detect
+        logger.info("Detecting browser cookies (one-time)...")
+        self._auto_browser = await self._detect_browser_async()
+        self._browser_detected = True
+        if self._auto_browser:
+            logger.info(f"Found browser cookies: {self._auto_browser}")
+        else:
+            logger.info("No browser cookies found (will download without cookies)")
 
     def escalate(self) -> bool:
         """Try next cookie strategy. Returns True if escalation happened."""
@@ -107,50 +127,41 @@ class CookieManager:
                 self._mode = "cookies_from_browser"
                 logger.info(f"Escalating to cookies from browser: {self.cookies_from_browser}")
                 return True
-            else:
-                # Auto-detect browser cookies
-                browser = self._detect_browser()
-                if browser:
-                    self._auto_browser = browser
-                    self._mode = "cookies_from_browser"
-                    logger.info(f"Escalating to auto-detected browser cookies: {browser}")
-                    return True
+            elif self._auto_browser:
+                self._mode = "cookies_from_browser"
+                logger.info(f"Escalating to auto-detected browser cookies: {self._auto_browser}")
+                return True
         elif self._mode == "cookies_file":
             if self.cookies_from_browser:
                 self._mode = "cookies_from_browser"
                 logger.info(f"Escalating to cookies from browser: {self.cookies_from_browser}")
                 return True
-            else:
-                browser = self._detect_browser()
-                if browser:
-                    self._auto_browser = browser
-                    self._mode = "cookies_from_browser"
-                    logger.info(f"Escalating to auto-detected browser cookies: {browser}")
-                    return True
+            elif self._auto_browser:
+                self._mode = "cookies_from_browser"
+                logger.info(f"Escalating to auto-detected browser cookies: {self._auto_browser}")
+                return True
 
         if not self._escalated:
             self._escalated = True
             logger.warning("Bot detection and no cookie strategies worked.")
         return False
 
-    def _detect_browser(self) -> str | None:
-        """Try each browser to see if yt-dlp can extract cookies from it."""
-        yt_dlp_bin = str(Path(sys.executable).parent / "yt-dlp")
-        if not Path(yt_dlp_bin).exists():
-            yt_dlp_bin = shutil.which("yt-dlp") or "yt-dlp"
+    async def _detect_browser_async(self) -> str | None:
+        """Try each browser to see if yt-dlp can extract cookies (non-blocking)."""
+        yt_dlp_bin = _find_yt_dlp()
 
         for browser in AUTO_BROWSERS:
             try:
-                proc = subprocess.run(
-                    [yt_dlp_bin, "--cookies-from-browser", browser,
-                     "--skip-download", "--no-warnings", "-q",
-                     "https://www.youtube.com/watch?v=dQw4w9WgXcQ"],
-                    capture_output=True, timeout=15,
+                proc = await asyncio.create_subprocess_exec(
+                    yt_dlp_bin, "--cookies-from-browser", browser,
+                    "--skip-download", "--no-warnings", "-q",
+                    "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
                 )
-                # If it didn't error about the browser, it worked
-                stderr = proc.stderr.decode(errors="replace").lower()
+                _, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=15)
+                stderr = stderr_bytes.decode(errors="replace").lower()
                 if "no supported browser" not in stderr and "could not find" not in stderr and "error" not in stderr:
-                    logger.info(f"Detected browser with cookies: {browser}")
                     return browser
             except Exception:
                 continue
@@ -192,14 +203,12 @@ async def download_video(
 
     t0 = time.monotonic()
 
-    # Find yt-dlp in the same venv as this Python process
-    yt_dlp_bin = str(Path(sys.executable).parent / "yt-dlp")
-    if not Path(yt_dlp_bin).exists():
-        yt_dlp_bin = shutil.which("yt-dlp") or "yt-dlp"
+    yt_dlp_bin = _find_yt_dlp()
 
     cmd = [
         yt_dlp_bin,
-        "-f", "best[ext=mp4]/best",
+        "-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b",
+        "--merge-output-format", "mp4",
         "-o", str(video_path),
         "--write-info-json",
         "--no-overwrites",
