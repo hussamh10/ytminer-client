@@ -144,14 +144,14 @@ class Uploader:
         wait = 30
         for attempt in range(5):
             try:
-                file_size = file_path.stat().st_size
-                with open(file_path, "rb") as f:
-                    resp = await self._http.post(
-                        url,
-                        content=f,
-                        params={"worker": self.worker_name, "filename": file_path.name},
-                        headers={"Content-Type": "application/octet-stream"},
-                    )
+                data = file_path.read_bytes()
+                file_size = len(data)
+                resp = await self._http.post(
+                    url,
+                    content=data,
+                    params={"worker": self.worker_name, "filename": file_path.name},
+                    headers={"Content-Type": "application/octet-stream"},
+                )
                 resp.raise_for_status()
                 self.total_bytes += file_size
                 return True
