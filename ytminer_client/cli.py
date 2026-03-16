@@ -103,21 +103,47 @@ class Uploader:
         self.enabled = enabled
         self.cleanup = cleanup
         self._http: httpx.AsyncClient | None = None
+        self._queue: asyncio.Queue | None = None
+        self._task: asyncio.Task | None = None
         self.total_uploaded = 0
         self.total_bytes = 0
+        self.pending = 0
 
     async def start(self):
         if self.enabled:
             self._http = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0))
+            self._queue = asyncio.Queue()
+            self._task = asyncio.create_task(self._worker())
 
     async def close(self):
+        if self._queue and self._task:
+            await self._queue.join()  # wait for pending uploads to finish
+            self._task.cancel()
         if self._http:
             await self._http.aclose()
 
-    async def upload_video(self, video_id: str, channel: str, channel_dir: Path) -> bool:
-        if not self.enabled or not self._http:
-            return False
+    def enqueue(self, video_id: str, channel: str, channel_dir: Path):
+        """Queue a video for background upload. Non-blocking."""
+        if self.enabled and self._queue is not None:
+            self._queue.put_nowait((video_id, channel, channel_dir))
+            self.pending += 1
 
+    async def _worker(self):
+        """Background task that drains the upload queue."""
+        while True:
+            try:
+                video_id, channel, channel_dir = await self._queue.get()
+                await self._upload_video(video_id, channel, channel_dir)
+                self._queue.task_done()
+                self.pending -= 1
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Upload worker error: {e}")
+                self._queue.task_done()
+                self.pending -= 1
+
+    async def _upload_video(self, video_id: str, channel: str, channel_dir: Path):
         video_path = channel_dir / f"{video_id}.mp4"
         info_path = channel_dir / f"{video_id}.info.json"
 
@@ -136,8 +162,6 @@ class Uploader:
 
         if success:
             self.total_uploaded += 1
-
-        return success
 
     async def _upload_file(self, channel: str, video_id: str, file_path: Path) -> bool:
         url = f"{self.server_url}/upload/{channel}/{video_id}"
@@ -293,11 +317,10 @@ async def download_loop(
                 click.echo(f"  [{i+1}/{len(video_ids)}] {video_id}  OK  {size_str}  {result.elapsed:.1f}s")
                 rate_limiter.report_success()
 
-                # Upload immediately after download
+                # Queue for background upload
                 if uploader.enabled:
-                    uploaded = await uploader.upload_video(video_id, batch_channel, channel_dir)
-                    if uploaded:
-                        click.echo(f"    -> uploaded")
+                    uploader.enqueue(video_id, batch_channel, channel_dir)
+                    click.echo(f"    -> queued for upload ({uploader.pending} pending)")
 
             elif result.status == "skipped":
                 session_skipped += 1
