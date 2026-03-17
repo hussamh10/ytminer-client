@@ -165,24 +165,36 @@ class Uploader:
 
     async def _upload_file(self, channel: str, video_id: str, file_path: Path) -> bool:
         url = f"{self.server_url}/upload/{channel}/{video_id}"
+        file_size = file_path.stat().st_size
+        # Scale timeout with file size: 60s base + 1s per MB, min 120s
+        timeout_secs = max(120, 60 + file_size // (1024 * 1024))
         wait = 30
         for attempt in range(5):
             try:
-                data = file_path.read_bytes()
-                file_size = len(data)
-                resp = await self._http.post(
-                    url,
-                    content=data,
-                    params={"worker": self.worker_name, "filename": file_path.name},
-                    headers={"Content-Type": "application/octet-stream"},
-                )
+                # Stream the file instead of loading into memory
+                with open(file_path, "rb") as f:
+                    resp = await self._http.post(
+                        url,
+                        content=f,
+                        params={"worker": self.worker_name, "filename": file_path.name},
+                        headers={
+                            "Content-Type": "application/octet-stream",
+                            "Content-Length": str(file_size),
+                        },
+                        timeout=httpx.Timeout(timeout_secs, connect=10.0),
+                    )
                 resp.raise_for_status()
                 self.total_bytes += file_size
                 return True
             except Exception as e:
-                logger.warning(f"Upload failed for {file_path.name} (attempt {attempt+1}): {e}")
-                await asyncio.sleep(wait)
-                wait = min(wait * 2, 300)
+                logger.warning(
+                    f"Upload failed for {file_path.name} "
+                    f"({format_size(file_size)}, attempt {attempt+1}/5): {e}"
+                )
+                if attempt < 4:
+                    await asyncio.sleep(wait)
+                    wait = min(wait * 2, 300)
+        logger.error(f"Giving up on {file_path.name} after 5 attempts — skipping")
         return False
 
 
