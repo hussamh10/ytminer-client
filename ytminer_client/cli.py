@@ -163,6 +163,16 @@ class Uploader:
         if success:
             self.total_uploaded += 1
 
+    @staticmethod
+    async def _file_chunks(file_path: Path, chunk_size: int = 1024 * 1024):
+        """Async generator that yields file contents in chunks for streaming upload."""
+        with open(file_path, "rb") as f:
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                yield chunk
+
     async def _upload_file(self, channel: str, video_id: str, file_path: Path) -> bool:
         url = f"{self.server_url}/upload/{channel}/{video_id}"
         file_size = file_path.stat().st_size
@@ -171,18 +181,18 @@ class Uploader:
         wait = 30
         for attempt in range(5):
             try:
-                # Stream the file instead of loading into memory
-                with open(file_path, "rb") as f:
-                    resp = await self._http.post(
-                        url,
-                        content=f,
-                        params={"worker": self.worker_name, "filename": file_path.name},
-                        headers={
-                            "Content-Type": "application/octet-stream",
-                            "Content-Length": str(file_size),
-                        },
-                        timeout=httpx.Timeout(timeout_secs, connect=10.0),
-                    )
+                # Stream via async generator — passing a sync file object to
+                # AsyncClient triggers "sync request with AsyncClient" error.
+                resp = await self._http.post(
+                    url,
+                    content=self._file_chunks(file_path),
+                    params={"worker": self.worker_name, "filename": file_path.name},
+                    headers={
+                        "Content-Type": "application/octet-stream",
+                        "Content-Length": str(file_size),
+                    },
+                    timeout=httpx.Timeout(timeout_secs, connect=10.0),
+                )
                 resp.raise_for_status()
                 self.total_bytes += file_size
                 return True
