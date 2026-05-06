@@ -23,6 +23,19 @@ def _find_yt_dlp() -> str:
     return shutil.which("yt-dlp") or "yt-dlp"
 
 
+def _find_ffmpeg() -> str | None:
+    """Locate ffmpeg: prefer system PATH, fall back to bundled imageio-ffmpeg."""
+    sys_ffmpeg = shutil.which("ffmpeg")
+    if sys_ffmpeg:
+        return sys_ffmpeg
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as e:
+        logger.warning(f"Could not locate ffmpeg (system or bundled): {e}")
+        return None
+
+
 # ─── Error Classification ──────────────────────────────────────
 
 
@@ -204,6 +217,7 @@ async def download_video(
     t0 = time.monotonic()
 
     yt_dlp_bin = _find_yt_dlp()
+    ffmpeg_bin = _find_ffmpeg()
 
     cmd = [
         yt_dlp_bin,
@@ -217,6 +231,8 @@ async def download_video(
         "--retries", "2",
         "--no-warnings",
     ]
+    if ffmpeg_bin:
+        cmd.extend(["--ffmpeg-location", ffmpeg_bin])
     cmd.extend(cookie_manager.get_args())
     cmd.append(f"https://www.youtube.com/watch?v={video_id}")
 
@@ -230,10 +246,21 @@ async def download_video(
         elapsed = time.monotonic() - t0
 
         if proc.returncode == 0:
-            size = video_path.stat().st_size if video_path.exists() else 0
+            if not video_path.exists() or video_path.stat().st_size == 0:
+                # yt-dlp reported success but produced no output file.
+                # Most common cause: separate streams were downloaded but the
+                # merge step was skipped (ffmpeg missing or merge failed).
+                logger.warning(
+                    f"yt-dlp returned 0 for {video_id} but {video_path.name} is "
+                    f"missing or empty (likely merge step failed)."
+                )
+                return DownloadResult(
+                    video_id=video_id, status="failed",
+                    error_category="missing_output", elapsed=elapsed,
+                )
             return DownloadResult(
                 video_id=video_id, status="ok",
-                file_size=size, elapsed=elapsed,
+                file_size=video_path.stat().st_size, elapsed=elapsed,
             )
 
         err_text = stderr.decode(errors="replace").strip()
