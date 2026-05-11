@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import platform
+import random
 import sys
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import click
@@ -18,6 +20,12 @@ from ytminer_client.downloader import CookieManager, DownloadResult, RateLimiter
 logger = logging.getLogger("ytminer-client")
 
 COOLDOWN_STEPS = [30 * 60, 60 * 60, 2 * 3600]  # 30m, 1h, 2h (then 2h forever)
+
+# Periodic long rest to look less bot-like to YouTube: after each 10–15h
+# of work (randomized per cycle) sleep for 3h, then resume.
+LONG_REST_AFTER_MIN_HOURS = 10
+LONG_REST_AFTER_MAX_HOURS = 15
+LONG_REST_DURATION_HOURS = 3
 
 
 def setup_logging(verbose: bool):
@@ -288,6 +296,11 @@ async def download_loop(
     session_start = time.monotonic()
     consecutive_bot = 0
 
+    next_long_rest_at = time.monotonic() + random.uniform(
+        LONG_REST_AFTER_MIN_HOURS * 3600,
+        LONG_REST_AFTER_MAX_HOURS * 3600,
+    )
+
     # One-time async browser detection (non-blocking)
     await cookie_manager.warmup()
 
@@ -389,6 +402,22 @@ async def download_loop(
         batch = resp.get("next_batch")
         if not batch:
             batch = await fetch_with_retry(server, channel, batch_size)
+
+        # Long rest: take a 3h break after every 10–15h of work to avoid
+        # looking like a 24/7 bot. Triggered between batches so we never
+        # interrupt a download or leave an unreported batch behind.
+        if time.monotonic() >= next_long_rest_at:
+            wake_at = datetime.now() + timedelta(hours=LONG_REST_DURATION_HOURS)
+            click.echo(
+                f"\n  Taking a {LONG_REST_DURATION_HOURS}h rest "
+                f"(resume around {wake_at:%H:%M})..."
+            )
+            await asyncio.sleep(LONG_REST_DURATION_HOURS * 3600)
+            click.echo(f"  Resuming downloads.\n")
+            next_long_rest_at = time.monotonic() + random.uniform(
+                LONG_REST_AFTER_MIN_HOURS * 3600,
+                LONG_REST_AFTER_MAX_HOURS * 3600,
+            )
 
         # Periodic version check
         if batch_count % update_check_interval == 0:
