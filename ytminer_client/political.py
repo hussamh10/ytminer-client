@@ -27,9 +27,13 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+import atexit
+
 import click
 import httpx
 import yt_dlp
+
+from ytminer_client.provider import ensure_provider
 
 EN_RE = re.compile(r"^en")
 CANARY_ID = "dQw4w9WgXcQ"  # Rick Astley — definitely has English captions
@@ -128,9 +132,13 @@ class TranscriptFetcher:
 def run_political(server_url: str, worker_name: str, provider_url: str,
                   delay: float, jitter: float, batch: int, concurrency: int,
                   langs: str = DEFAULT_LANGS, no_canary: bool = False,
-                  idle_sleep: int = 30) -> int:
+                  no_auto_provider: bool = False, idle_sleep: int = 30) -> int:
     """Lease ids -> fetch transcripts -> post results. Returns an exit code."""
     server_url = server_url.rstrip("/")
+    # auto-start a bgutil PO-token provider if one isn't already running (one command!)
+    proc = ensure_provider(provider_url, no_auto=no_auto_provider)
+    if proc is not None:
+        atexit.register(lambda: proc.terminate())
     fetcher = TranscriptFetcher([s.strip() for s in langs.split(",")], provider_url)
     http = httpx.Client(timeout=httpx.Timeout(120.0, connect=10.0))
 

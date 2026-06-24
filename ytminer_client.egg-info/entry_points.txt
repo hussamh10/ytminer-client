@@ -1,0 +1,2 @@
+[console_scripts]
+ytminer-download = ytminer_client.cli:main

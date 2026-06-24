@@ -458,9 +458,11 @@ async def download_loop(
               help="[--political-videos] bgutil PO-token provider URL (default http://127.0.0.1:4416)")
 @click.option("--concurrency", default=1,
               help="[--political-videos] parallel fetches (default 1; honors --delay/--jitter when 1)")
+@click.option("--no-auto-provider", "no_auto_provider", is_flag=True,
+              help="[--political-videos] don't auto-start a PO-token provider (use one at --provider-url)")
 @click.option("--verbose", is_flag=True, help="Enable debug logging")
 def main(server, output, worker_name, channel, batch_size, delay, jitter, cookies, cookies_from_browser,
-         upload, keep_files, political_videos, provider_url, concurrency, verbose):
+         upload, keep_files, political_videos, provider_url, concurrency, no_auto_provider, verbose):
     """Download YouTube videos from a ytminer server (or transcripts with --political-videos)."""
     setup_logging(verbose)
 
@@ -474,6 +476,7 @@ def main(server, output, worker_name, channel, batch_size, delay, jitter, cookie
         rc = run_political(
             server_url=server, worker_name=worker_name, provider_url=provider_url,
             delay=delay, jitter=jitter, batch=batch_size, concurrency=concurrency,
+            no_auto_provider=no_auto_provider,
         )
         sys.exit(rc or 0)
 
