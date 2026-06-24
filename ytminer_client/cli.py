@@ -451,13 +451,31 @@ async def download_loop(
 @click.option("--cookies-from-browser", default=None, help="Browser to extract cookies from (e.g. chrome, firefox)")
 @click.option("--upload", is_flag=True, help="Upload videos to server after download (for ephemeral envs like Colab)")
 @click.option("--keep-files", is_flag=True, help="Keep local files after upload (default: delete after upload)")
+@click.option("--political-videos", "political_videos", is_flag=True,
+              help="Transcript mode: lease video ids from a transcript coordinator (--server), fetch their "
+                   "English captions (yt-dlp + a local bgutil PO-token provider), and post them back.")
+@click.option("--provider-url", default="http://127.0.0.1:4416",
+              help="[--political-videos] bgutil PO-token provider URL (default http://127.0.0.1:4416)")
+@click.option("--concurrency", default=1,
+              help="[--political-videos] parallel fetches (default 1; honors --delay/--jitter when 1)")
 @click.option("--verbose", is_flag=True, help="Enable debug logging")
-def main(server, output, worker_name, channel, batch_size, delay, jitter, cookies, cookies_from_browser, upload, keep_files, verbose):
-    """Download YouTube videos from a ytminer server."""
+def main(server, output, worker_name, channel, batch_size, delay, jitter, cookies, cookies_from_browser,
+         upload, keep_files, political_videos, provider_url, concurrency, verbose):
+    """Download YouTube videos from a ytminer server (or transcripts with --political-videos)."""
     setup_logging(verbose)
 
     if worker_name is None:
         worker_name = platform.node() or "anonymous"
+
+    # ── Political-transcripts mode: a separate path (different coordinator API + fetches
+    #    transcripts, not videos). Everything below (the default video pipeline) is untouched.
+    if political_videos:
+        from ytminer_client.political import run_political
+        rc = run_political(
+            server_url=server, worker_name=worker_name, provider_url=provider_url,
+            delay=delay, jitter=jitter, batch=batch_size, concurrency=concurrency,
+        )
+        sys.exit(rc or 0)
 
     output_dir = Path(output)
     output_dir.mkdir(parents=True, exist_ok=True)
